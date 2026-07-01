@@ -1,169 +1,169 @@
 # WShell
 
-加密直连远程 Shell —— SSH 的稳定替代方案。
+Encrypted direct-connect remote shell — a stable, secure alternative to SSH.
 
-## 为什么做这个？
+## Why?
 
-SSH 在网络波动时容易断连。WShell 用 WebSocket + libsodium 加密，解决了这个问题：
+SSH drops connections when the network hiccups. WShell doesn't:
 
-| 特性 | SSH | WShell |
-|------|-----|--------|
-| 协议 | TCP 直连 | WebSocket |
-| 加密 | 内置 | libsodium (XChaCha20-Poly1305) |
-| 断线重连 | 手动 | 自动（指数退避） |
-| 会话保持 | 断了就丢 | 服务端保留 |
-| 心跳检测 | TCP keepalive（慢） | 应用层 15 秒 |
-| 消息缓冲 | 无 | 有 |
+| Feature | SSH | WShell |
+|---------|-----|--------|
+| Protocol | TCP raw | WebSocket |
+| Encryption | Built-in | libsodium (XChaCha20-Poly1305) |
+| Reconnect | Manual | Auto (exponential backoff) |
+| Session persistence | Lost on disconnect | Kept server-side |
+| Heartbeat | TCP keepalive (slow) | App-level 15s |
+| Message buffering | None | Yes |
 
-## 架构
+## Architecture
 
 ```
 ┌──────────────┐         ┌──────────────┐
-│  客户端      │◄──TLS──►│  服务端      │
-│  (你的电脑)  │  或      │  (VPS)       │
-│              │  普通     │              │
-│  - CLI 交互  │  WS      │  - Shell     │
-│  - 自动重连  │         │  - 命令执行   │
-│              │         │  - 文件传输   │
+│  Client      │◄──TLS──►│  Server      │
+│  (your Mac)  │  or     │  (VPS)       │
+│              │  plain  │              │
+│  - CLI REPL  │  WS     │  - Shell     │
+│  - Auto      │         │  - Exec      │
+│    reconnect │         │  - Files     │
 └──────────────┘         └──────────────┘
 ```
 
-认证后所有通信都经过 libsodium 加密：
-- 密钥通过 auth token 派生（`crypto_kdf`）
-- 每条消息使用随机 24 字节 nonce
-- XChaCha20-Poly1305 认证加密
+After authentication, all messages are encrypted with libsodium:
+- Key derived from auth token via `crypto_kdf`
+- Each message uses a random 24-byte nonce
+- XChaCha20-Poly1305 authenticated encryption
 
-## 安装
+## Install
 
-需要 Node.js >= 18。
+Requires Node.js >= 18.
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/zt8h7cwrrc-coder/WShell.git
 cd wshell
 npm run build
 ```
 
-`npm run build` 会自动安装依赖并编译 TypeScript。
+`npm run build` automatically installs dependencies and compiles TypeScript.
 
-## 快速开始
+## Quick Start
 
-### 1. 服务端（部署在 VPS 上）
+### 1. Server (deploy on your VPS)
 
 ```bash
-# 添加用户（会生成 token，记下来）
+# Add a user (save the generated token)
 node dist/cli/server.js user add admin -p mypassword
 
-# 启动服务
+# Start the server
 node dist/cli/server.js start
 ```
 
-输出示例：
+Output:
 ```
   User "admin" created.
   Token: a1b2c3d4e5f6...
 
   Add this host to your client:
-    wshell config add myhost admin@<服务器IP>
+    wshell config add myhost admin@<server-ip>
   Then edit ~/.wshell/config.json to paste the token.
 ```
 
-**重要：把 token 保存好，客户端连接时需要。**
+**Important: Keep the token safe — you'll need it for client connections.**
 
-### 2. 客户端（你的电脑上）
+### 2. Client (on your local machine)
 
-#### 方式一：直接用 token 连接
+#### Option A: Connect directly with token
 
 ```bash
-node dist/cli/client.js --token <token> --server ws://你的VPS:7700 admin@你的VPS
+node dist/cli/client.js --token <token> --server ws://your-vps:7700 admin@your-vps
 ```
 
-#### 方式二：保存配置后连接
+#### Option B: Save config first, then connect
 
 ```bash
-# 保存主机配置
-node dist/cli/client.js config add myhost admin@你的VPS
+# Save host config
+node dist/cli/client.js config add myhost admin@your-vps
 
-# 编辑配置文件，填入 token
+# Edit config file and paste the token
 # ~/.wshell/config.json:
 # {
 #   "hosts": {
 #     "myhost": {
 #       "user": "admin",
-#       "host": "你的VPS",
+#       "host": "your-vps",
 #       "port": 7700,
 #       "token": "a1b2c3d4e5f6..."
 #     }
 #   }
 # }
 
-# 之后直接用名字连接
+# Connect using saved name
 node dist/cli/client.js myhost
 ```
 
-## 使用说明
+## Usage
 
-### 客户端命令（wshell）
+### Client Commands (wshell)
 
 ```bash
-# 交互式 Shell
+# Interactive shell
 wshell <user@host>
-wshell <user@host:port>         # 指定端口
-wshell <name>                   # 用保存的配置名
+wshell <user@host:port>         # With port
+wshell <name>                   # Use saved config
 
-# 执行单条命令
+# Execute a single command
 wshell <user@host> exec "ls -la"
 wshell <user@host> exec "df -h"
 
-# 上传文件
+# Upload file
 wshell <user@host> put ./local.txt /remote/path.txt
 
-# 下载文件
+# Download file
 wshell <user@host> get /remote/path.txt ./local.txt
 
-# 生成新 token
+# Generate new token
 wshell keygen
 
-# 查看帮助
+# Show help
 wshell help
 ```
 
-### 交互式 Shell 内部命令
+### Interactive Shell Commands
 
-连接成功后进入交互模式，支持以下命令：
+After connecting, use these commands in the interactive mode:
 
 ```
-wshell> /shell                    # 打开交互式终端
-wshell> /exec ls -la              # 执行命令
-wshell> /put ./file.txt /tmp/f    # 上传文件
-wshell> /get /tmp/f ./file.txt    # 下载文件
-wshell> /quit                     # 退出
+wshell> /shell                    # Open interactive terminal
+wshell> /exec ls -la              # Execute command
+wshell> /put ./file.txt /tmp/f    # Upload file
+wshell> /get /tmp/f ./file.txt    # Download file
+wshell> /quit                     # Exit
 ```
 
-直接输入内容会发送到 Shell 会话中。
+Direct input is sent to the shell session.
 
-### 服务端命令（wshelld）
+### Server Commands (wshelld)
 
 ```bash
-# 用户管理
-node dist/cli/server.js user add <name> -p <password>    # 添加用户
-node dist/cli/server.js user list                         # 列出用户
-node dist/cli/server.js user remove <name>                # 删除用户
+# User management
+node dist/cli/server.js user add <name> -p <password>    # Add user
+node dist/cli/server.js user list                         # List users
+node dist/cli/server.js user remove <name>                # Remove user
 
-# 启动服务
-node dist/cli/server.js start                             # 启动守护进程
+# Start daemon
+node dist/cli/server.js start
 
-# 选项
-  -P, --port <port>     监听端口（默认 7700）
-  -H, --host <host>     监听地址（默认 0.0.0.0）
-  -a, --auth <file>     认证文件路径（默认 ./wshell-auth.json）
+# Options
+  -P, --port <port>     Listen port (default: 7700)
+  -H, --host <host>     Listen address (default: 0.0.0.0)
+  -a, --auth <file>     Auth file path (default: ./wshell-auth.json)
 
-# 查看帮助
+# Show help
 node dist/cli/server.js help
 ```
 
-### 配置文件
+### Config File
 
-配置保存在 `~/.wshell/config.json`：
+Configuration is stored at `~/.wshell/config.json`:
 
 ```json
 {
@@ -172,96 +172,95 @@ node dist/cli/server.js help
       "user": "admin",
       "host": "123.45.67.89",
       "port": 7700,
-      "token": "你的token"
+      "token": "your-token"
     },
     "dev": {
       "user": "dev",
       "host": "10.0.0.1",
       "port": 7700,
-      "token": "另一个token"
+      "token": "another-token"
     }
   }
 }
 ```
 
-## 安全设计
+## Security
 
-| 层级 | 机制 |
-|------|------|
-| 认证 | bcrypt 密码哈希（10 轮） |
-| Token | 随机生成，存储为 SHA-256 指纹 |
-| 加密 | libsodium XChaCha20-Poly1305 |
-| 密钥派生 | `crypto_kdf` 从 token 派生子密钥 |
-| 消息格式 | `[0x00 标志][4字节 nonce 长度][24字节 nonce][密文]` |
-| 认证前 | 明文 JSON |
-| 认证后 | 全部加密 |
+| Layer | Mechanism |
+|-------|-----------|
+| Authentication | bcrypt password hashing (10 rounds) |
+| Token | Random generation, stored as SHA-256 fingerprints |
+| Encryption | libsodium XChaCha20-Poly1305 |
+| Key derivation | `crypto_kdf` from auth token |
+| Message format | `[0x00 flag][4-byte nonce length][24-byte nonce][ciphertext]` |
+| Before auth | Plaintext JSON |
+| After auth | Fully encrypted |
 
-## 项目结构
+## Project Structure
 
 ```
 wshell/
 ├── src/
 │   ├── cli/
-│   │   ├── client.ts         # 客户端 CLI
-│   │   ├── server.ts         # 服务端 CLI
-│   │   └── start.ts          # 服务端启动入口
+│   │   ├── client.ts         # Client CLI
+│   │   ├── server.ts         # Server CLI
+│   │   └── start.ts          # Server entry point
 │   ├── server/
-│   │   └── index.ts          # TunnelServer 类
+│   │   └── index.ts          # TunnelServer class
 │   ├── client/
-│   │   └── index.ts          # TunnelClient 类
+│   │   └── index.ts          # TunnelClient class
 │   ├── crypto/
-│   │   ├── index.ts          # libsodium 加密封装
-│   │   └── sodium-native.d.ts  # sodium-native 类型声明
+│   │   ├── index.ts          # libsodium encryption
+│   │   └── sodium-native.d.ts  # sodium-native types
 │   └── shared/
-│       ├── protocol.ts       # 消息格式定义
-│       ├── auth.ts           # 认证模块
-│       └── config.ts         # 配置管理
+│       ├── protocol.ts       # Message format
+│       ├── auth.ts           # Authentication
+│       └── config.ts         # Config management
 ├── scripts/
-│   └── generate-licenses.cjs # 第三方许可证生成脚本
-├── THIRD_PARTY_LICENSES/     # 第三方许可证（自动生成）
-├── LICENSE                   # MIT 许可证
+│   └── generate-licenses.cjs # License generator
+├── THIRD_PARTY_LICENSES.md   # Auto-generated licenses
+├── LICENSE                   # MIT License
 ├── package.json
 ├── tsconfig.json
 └── README.md
 ```
 
-## 开发
+## Development
 
 ```bash
-# 开发模式运行（无需编译）
-npm run dev:server            # 启动服务端
-npm run dev:client            # 运行客户端
+# Dev mode (no compile needed)
+npm run dev:server            # Start server
+npm run dev:client            # Run client
 
-# 编译
+# Build
 npm run build
 
-# 清理编译产物
+# Clean build artifacts
 npm run clean
 
-# 重新生成第三方许可证
+# Regenerate third-party licenses
 npm run licenses
 ```
 
-## 部署建议
+## Deployment
 
-### 服务端部署
+### Server Deployment
 
 ```bash
-# 在 VPS 上
-git clone <repo-url> && cd wshell
+# On your VPS
+git clone https://github.com/zt8h7cwrrc-coder/WShell.git && cd wshell
 npm run build
-node dist/cli/server.js user add admin -p <密码>
+node dist/cli/server.js user add admin -p <password>
 
-# 用 pm2 或 systemd 保持运行
+# Keep running with pm2
 pm2 start node -- dist/cli/server.js start
-# 或
-# 用 screen/tmux
+# Or use screen/tmux
 screen -S wshelld node dist/cli/server.js start
 ```
 
-### 防火墙
+### Firewall
 
-确保 VPS 的 7700 端口（或你指定的端口）对外开放：
+Open port 7700 (or your custom port) on your VPS:
 
 ```bash
 # Ubuntu/Debian
@@ -272,9 +271,9 @@ firewall-cmd --permanent --add-port=7700/tcp
 firewall-cmd --reload
 ```
 
-### 反向代理（可选）
+### Reverse Proxy (Optional)
 
-如果需要通过域名访问，可以用 Nginx 做 WebSocket 代理：
+For domain access with SSL, use Nginx as a WebSocket proxy:
 
 ```nginx
 server {
@@ -295,7 +294,7 @@ server {
 }
 ```
 
-客户端连接时用：
+Then connect with:
 
 ```bash
 wshell --server wss://shell.example.com admin@shell.example.com
