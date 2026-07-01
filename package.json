@@ -1,0 +1,47 @@
+{
+  "name": "wshell",
+  "version": "0.1.0",
+  "description": "Encrypted direct-connect remote shell — stable alternative to SSH",
+  "type": "module",
+  "main": "dist/server/index.js",
+  "bin": {
+    "wshell": "./dist/cli/client.js",
+    "wshelld": "./dist/cli/server.js",
+    "wshelld-start": "./dist/cli/start.js"
+  },
+  "scripts": {
+    "build": "npm install && tsc",
+    "clean": "rm -rf dist",
+    "server": "node dist/cli/start.js",
+    "client": "node dist/cli/client.js",
+    "dev:server": "tsx src/cli/start.ts",
+    "dev:client": "tsx src/cli/client.ts",
+    "licenses": "node scripts/generate-licenses.cjs"
+  },
+  "keywords": [
+    "ssh",
+    "shell",
+    "websocket",
+    "remote-access",
+    "encrypted"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "sodium-native": "^5.1.0",
+    "ws": "^8.16.0",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "@types/yargs": "^17.0.32",
+    "license-checker": "^25.0.1",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}

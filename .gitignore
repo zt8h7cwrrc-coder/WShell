@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.log
+wshell-auth.json
+.DS_Store
