@@ -305,4 +305,4 @@ wshell --server wss://shell.example.com admin@shell.example.com
 
 MIT — see [LICENSE](LICENSE)
 
-Third-party licenses — see [THIRD_PARTY_LICENSES/](THIRD_PARTY_LICENSES/)
+Third-party licenses — see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)
