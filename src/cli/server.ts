@@ -5,20 +5,23 @@
  * WShell Server Daemon (wshelld)
  *
  * Usage:
- *   wshelld                                    Start daemon
- *   wshelld user add <name> -p <password>      Add user
- *   wshelld user list                          List users
- *   wshelld user remove <name>                 Remove user
- *   wshelld help                               Show help
+ *   wshelld start                                Start daemon
+ *   wshelld user add <name> -p <password>        Add user
+ *   wshelld user list                            List users
+ *   wshelld user remove <name>                   Remove user
+ *   wshelld help                                 Show help
  *
  * Options:
  *   -P, --port <port>     Listen port (default: 7700)
  *   -H, --host <host>     Listen address (default: 0.0.0.0)
- *   -a, --auth <file>     Auth file path (default: ./wshell-auth.json)
+ *   -a, --auth <file>     Auth file path (default: ~/.wshell/auth.json)
+ *   -r, --root <dir>      Sandbox root for file transfers/exec cwd
+ *   -m, --max-conn <n>    Max concurrent clients (default: 64)
  */
 
 import { TunnelServer } from "../server/index.js";
-import { Authenticator } from "../shared/auth.js";
+import { Authenticator, DEFAULT_AUTH_FILE } from "../shared/auth.js";
+import { fatal } from "./util.js";
 
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -31,31 +34,32 @@ function banner() {
   console.log();
 }
 
-function fatal(msg: string): never {
-  console.error(`wshelld: ${msg}`);
-  process.exit(1);
-}
-
 function showHelp() {
   console.log(`
   Usage:
-    wshelld                                    Start daemon
-    wshelld user add <name> -p <password>      Add user
-    wshelld user list                          List users
-    wshelld user remove <name>                 Remove user
-    wshelld help                               Show this message
+    wshelld start                                Start daemon
+    wshelld user add <name> -p <password>        Add user
+    wshelld user list                            List users
+    wshelld user remove <name>                   Remove user
+    wshelld help                                 Show this message
 
   Options:
     -P, --port <port>     Listen port (default: 7700)
     -H, --host <host>     Listen address (default: 0.0.0.0)
-    -a, --auth <file>     Auth file (default: ./wshell-auth.json)
+    -a, --auth <file>     Auth file (default: ~/.wshell/auth.json)
+    -r, --root <dir>      Sandbox root for file transfers/exec cwd
 `);
 }
 
 /* ─── Parse args ──────────────────────────────────────────────────────── */
 
-function parseArgs(args: string[]): { flags: Record<string, string | boolean>; positional: string[] } {
-  const flags: Record<string, string | boolean> = {};
+interface ParsedArgs {
+  flags: Record<string, string>;
+  positional: string[];
+}
+
+function parseArgs(args: string[]): ParsedArgs {
+  const flags: Record<string, string> = {};
   const positional: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -66,6 +70,10 @@ function parseArgs(args: string[]): { flags: Record<string, string | boolean>; p
       flags.host = args[++i];
     } else if (arg === "-a" || arg === "--auth") {
       flags.auth = args[++i];
+    } else if (arg === "-r" || arg === "--root") {
+      flags.root = args[++i];
+    } else if (arg === "-m" || arg === "--max-conn") {
+      flags.maxConn = args[++i];
     } else if (arg === "-p" || arg === "--password") {
       flags.password = args[++i];
     } else if (!arg.startsWith("-")) {
@@ -78,14 +86,14 @@ function parseArgs(args: string[]): { flags: Record<string, string | boolean>; p
 
 /* ─── User commands ───────────────────────────────────────────────────── */
 
-async function cmdUser(args: string[], flags: Record<string, string | boolean>) {
+async function cmdUser(args: string[], flags: Record<string, string>) {
   const sub = args[0];
-  const authFile = (flags.auth as string) || "wshell-auth.json";
+  const authFile = flags.auth || DEFAULT_AUTH_FILE;
   const auth = new Authenticator(authFile);
 
   if (sub === "add") {
     const name = args[1];
-    const password = flags.password as string;
+    const password = flags.password;
     if (!name) fatal("Usage: wshelld user add <name> -p <password>");
     if (!password) fatal("Password required: -p <password>");
 
@@ -124,6 +132,18 @@ async function cmdUser(args: string[], flags: Record<string, string | boolean>) 
   fatal(`Unknown user command: ${sub}\n  Run: wshelld help`);
 }
 
+/* ─── Start command ───────────────────────────────────────────────────── */
+
+function cmdStart(flags: Record<string, string>) {
+  new TunnelServer({
+    port: flags.port ? parseInt(flags.port, 10) : 7700,
+    host: flags.host || "0.0.0.0",
+    authFile: flags.auth || DEFAULT_AUTH_FILE,
+    rootDir: flags.root,
+    maxConnections: flags.maxConn ? parseInt(flags.maxConn, 10) : 64,
+  });
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 async function main() {
@@ -135,13 +155,24 @@ async function main() {
     return;
   }
 
-  if (positional[0] === "user") {
+  const command = positional[0];
+
+  if (command === "start") {
+    banner();
+    cmdStart(flags);
+    return;
+  }
+
+  if (command === "user") {
     banner();
     await cmdUser(positional.slice(1), flags);
     return;
   }
 
-  fatal(`Unknown command: ${positional[0]}\n  Run: wshelld help`);
+  fatal(`Unknown command: ${command}\n  Run: wshelld help`);
 }
 
-main().catch(console.error);
+main().catch((e) => {
+  console.error(e instanceof Error ? e.message : String(e));
+  process.exit(1);
+});

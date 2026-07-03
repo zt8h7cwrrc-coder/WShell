@@ -18,13 +18,11 @@
  *   wshell help                               Show help
  */
 
-import { TunnelClient, ClientConfig } from "../client/index.js";
-import { Config, HostConfig } from "../shared/config.js";
-import { createInterface, Interface } from "readline";
+import { TunnelClient } from "../client/index.js";
+import { Config, type HostConfig } from "../shared/config.js";
+import * as readline from "readline";
 import { randomBytes } from "crypto";
-import { join } from "path";
-import { existsSync, writeFileSync, mkdirSync } from "fs";
-import { homedir } from "os";
+import { fatal } from "./util.js";
 
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -35,11 +33,6 @@ function banner() {
   console.log("  │   encrypted · stable · fast       │");
   console.log("  └──────────────────────────────────┘");
   console.log();
-}
-
-function fatal(msg: string): never {
-  console.error(`wshell: ${msg}`);
-  process.exit(1);
 }
 
 function showHelp() {
@@ -138,7 +131,12 @@ function cmdConfig(args: string[]) {
 
 /* ─── Resolve target ──────────────────────────────────────────────────── */
 
-function resolveTarget(target: string, portFlag?: number, tokenFlag?: string, serverFlag?: string): HostConfig {
+function resolveTarget(
+  target: string,
+  portFlag?: number,
+  tokenFlag?: string,
+  serverFlag?: string,
+): HostConfig {
   const config = new Config();
   const parsed = Config.parseTarget(target);
 
@@ -164,7 +162,7 @@ function resolveTarget(target: string, portFlag?: number, tokenFlag?: string, se
     try {
       const url = new URL(serverFlag.replace(/^ws:\/\//, "http://"));
       host = url.hostname;
-      port = portFlag || url.port ? parseInt(url.port, 10) : port;
+      port = portFlag || (url.port ? parseInt(url.port, 10) : port);
     } catch {
       // Use as-is
     }
@@ -176,6 +174,31 @@ function resolveTarget(target: string, portFlag?: number, tokenFlag?: string, se
     port,
     token: tokenFlag || "",
   };
+}
+
+/* ─── Raw mode safety ─────────────────────────────────────────────────── */
+
+function enterRawMode(): void {
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+}
+
+function leaveRawMode(): void {
+  try {
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  } catch {
+    /* ignore */
+  }
+}
+
+/* ─── One-shot connect helper ─────────────────────────────────────────── */
+
+async function connectOnce(target: HostConfig): Promise<TunnelClient> {
+  const client = new TunnelClient({
+    server: `ws://${target.host}:${target.port}`,
+    token: target.token,
+  });
+  await client.connect();
+  return client;
 }
 
 /* ─── Interactive shell ───────────────────────────────────────────────── */
@@ -191,66 +214,93 @@ async function cmdShell(target: HostConfig) {
   });
 
   let currentSession: string | null = null;
-  let rl: Interface | null = null;
+  let rl: readline.Interface | null = null;
+
+  // Restore terminal state on any exit path.
+  const cleanup = () => {
+    leaveRawMode();
+    client.close();
+  };
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
 
   client.onShellOutput(
     (_id, data) => process.stdout.write(data),
-    (_id) => {
+    (_id, info) => {
       currentSession = null;
-      console.log("\n[shell closed]");
+      leaveRawMode();
+      console.log(
+        `\n[shell closed · exit ${info.exitCode}${info.signal ? ` (${info.signal})` : ""}]`,
+      );
       prompt();
     },
   );
 
   function prompt() {
     if (!rl || currentSession) return;
-    rl.question(`\x1b[36m${target.user}@${target.host}>\x1b[0m `, async (answer) => {
+    rl.question(`\x1b[36m${target.user}@${target.host}>\x1b[0m `, async (answer: string) => {
       const cmd = answer.trim();
-      if (!cmd) { prompt(); return; }
+      if (!cmd) {
+        prompt();
+        return;
+      }
       try {
         await handleShellCmd(client, cmd, target);
-      } catch (e: any) {
-        console.log(`Error: ${e.message}`);
+      } catch (e) {
+        console.log(`Error: ${e instanceof Error ? e.message : String(e)}`);
       }
       prompt();
     });
   }
 
-  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  // Forward terminal resize events to the remote shell.
+  process.stdout.on("resize", () => {
+    if (currentSession) {
+      client.resizeShell(currentSession, process.stdout.columns || 80, process.stdout.rows || 24);
+    }
+  });
 
   process.stdin.on("data", (data) => {
     if (!currentSession) return;
     const str = data.toString("utf-8");
     if (str === "\x03" || str === "\x04") {
-      if (currentSession) {
-        client.closeShell(currentSession);
-        currentSession = null;
-        console.log("\n[shell closed]");
-        prompt();
-      }
+      // Ctrl-C / Ctrl-D: leave the remote shell but keep the client.
+      client.closeShell(currentSession);
+      currentSession = null;
+      leaveRawMode();
+      console.log("\n[shell closed]");
+      prompt();
       return;
     }
     client.sendShellData(currentSession, str);
   });
 
-  await client.connect();
   console.log(`  Connecting to ${target.user}@${target.host}:${target.port}...`);
+  await client.connect();
   console.log();
 
-  setTimeout(() => {
-    rl = createInterface({ input: process.stdin, output: process.stdout });
-    console.log("  Commands: /shell, /exec, /put, /get, /quit");
-    console.log();
-    prompt();
-  }, 1500);
+  rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  console.log("  Commands: /shell, /exec, /put, /get, /quit");
+  console.log();
+  prompt();
 
   async function handleShellCmd(client: TunnelClient, cmd: string, target: HostConfig) {
-    if (cmd === "/quit" || cmd === "/exit") { client.close(); process.exit(0); }
+    if (cmd === "/quit" || cmd === "/exit") {
+      cleanup();
+      process.exit(0);
+    }
 
     if (cmd === "/shell") {
       const cols = process.stdout.columns || 80;
       const rows = process.stdout.rows || 24;
       currentSession = await client.openShell(cols, rows);
+      enterRawMode();
       console.log(`[shell ${currentSession}]`);
       return;
     }
@@ -265,18 +315,27 @@ async function cmdShell(target: HostConfig) {
 
     if (cmd.startsWith("/put ")) {
       const [lp, rp] = cmd.slice(5).split(/\s+/);
-      if (!lp || !rp) { console.log("Usage: /put <local> <remote>"); return; }
+      if (!lp || !rp) {
+        console.log("Usage: /put <local> <remote>");
+        return;
+      }
       await client.uploadFile(lp, rp);
-      console.log("Upload complete.");
+      console.log(`Uploaded ${lp} → ${target.host}:${rp}`);
       return;
     }
 
     if (cmd.startsWith("/get ")) {
-      console.log("(download not yet implemented in this demo)");
+      const [rp, lp] = cmd.slice(5).split(/\s+/);
+      if (!rp || !lp) {
+        console.log("Usage: /get <remote> <local>");
+        return;
+      }
+      await client.downloadFile(rp, lp);
+      console.log(`Downloaded ${target.host}:${rp} → ${lp}`);
       return;
     }
 
-    console.log(`Unknown: ${cmd}`);
+    console.log(`Unknown: ${cmd}\n  Commands: /shell, /exec, /put, /get, /quit`);
   }
 }
 
@@ -285,21 +344,17 @@ async function cmdShell(target: HostConfig) {
 async function cmdExec(target: HostConfig, command: string) {
   if (!target.token) fatal("No token configured");
 
-  const client = new TunnelClient({
-    server: `ws://${target.host}:${target.port}`,
-    token: target.token,
-  });
-
-  await client.connect();
-  await new Promise((r) => setTimeout(r, 1000));
+  const client = await connectOnce(target);
 
   try {
     const result = await client.exec(command);
     if (result.stdout) process.stdout.write(result.stdout);
     if (result.stderr) process.stderr.write(result.stderr);
-    process.exit(result.exitCode);
-  } catch (e: any) {
-    fatal(e.message);
+    client.close();
+    process.exit(result.exitCode ?? 0);
+  } catch (e) {
+    client.close();
+    fatal(e instanceof Error ? e.message : String(e));
   }
 }
 
@@ -308,21 +363,16 @@ async function cmdExec(target: HostConfig, command: string) {
 async function cmdPut(target: HostConfig, local: string, remote: string) {
   if (!target.token) fatal("No token configured");
 
-  const client = new TunnelClient({
-    server: `ws://${target.host}:${target.port}`,
-    token: target.token,
-  });
-
-  await client.connect();
-  await new Promise((r) => setTimeout(r, 1000));
+  const client = await connectOnce(target);
 
   try {
     await client.uploadFile(local, remote);
     console.log(`Uploaded ${local} → ${target.host}:${remote}`);
-  } catch (e: any) {
-    fatal(e.message);
+    client.close();
+  } catch (e) {
+    client.close();
+    fatal(e instanceof Error ? e.message : String(e));
   }
-  client.close();
 }
 
 /* ─── Direct download ─────────────────────────────────────────────────── */
@@ -330,18 +380,15 @@ async function cmdPut(target: HostConfig, local: string, remote: string) {
 async function cmdGet(target: HostConfig, remote: string, local: string) {
   if (!target.token) fatal("No token configured");
 
-  const client = new TunnelClient({
-    server: `ws://${target.host}:${target.port}`,
-    token: target.token,
-  });
+  const client = await connectOnce(target);
 
   try {
-    await client.connect();
     await client.downloadFile(remote, local);
     console.log(`Downloaded ${target.host}:${remote} → ${local}`);
     client.close();
-  } catch (e: any) {
-    fatal(`Download failed: ${e.message}`);
+  } catch (e) {
+    client.close();
+    fatal(`Download failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -430,4 +477,7 @@ async function main() {
   fatal(`Unknown command: ${sub}\n  Run: wshell help`);
 }
 
-main().catch(console.error);
+main().catch((e) => {
+  console.error(e instanceof Error ? e.message : String(e));
+  process.exit(1);
+});

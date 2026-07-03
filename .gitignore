@@ -3,3 +3,7 @@ dist/
 *.log
 wshell-auth.json
 .DS_Store
+*.tsbuildinfo
+coverage/
+.env
+.workbuddy/

@@ -19,7 +19,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import { homedir } from "os";
 
 export interface HostConfig {
@@ -33,8 +33,10 @@ export interface WShellConfig {
   hosts: Record<string, HostConfig>;
 }
 
-const CONFIG_DIR = join(homedir(), ".wshell");
-const CONFIG_FILE = join(CONFIG_DIR, "config.json");
+/** Default config directory: ~/.wshell */
+export const CONFIG_DIR = join(homedir(), ".wshell");
+/** Default config file: ~/.wshell/config.json */
+export const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 
 const DEFAULTS: WShellConfig = { hosts: {} };
 
@@ -48,16 +50,40 @@ export class Config {
   }
 
   private load(): WShellConfig {
-    if (existsSync(this.path)) {
-      return JSON.parse(readFileSync(this.path, "utf-8"));
+    if (!existsSync(this.path)) return { ...DEFAULTS };
+    try {
+      const parsed = JSON.parse(readFileSync(this.path, "utf-8"));
+      if (typeof parsed !== "object" || parsed === null) {
+        throw new Error("config root is not an object");
+      }
+      // Coerce shape defensively: only keep known host fields.
+      const hosts: Record<string, HostConfig> = {};
+      if (parsed.hosts && typeof parsed.hosts === "object") {
+        for (const [name, h] of Object.entries(parsed.hosts)) {
+          if (h && typeof h === "object") {
+            const hc = h as Partial<HostConfig>;
+            hosts[name] = {
+              host: String(hc.host ?? ""),
+              port: Number(hc.port) || 0,
+              user: String(hc.user ?? ""),
+              token: String(hc.token ?? ""),
+            };
+          }
+        }
+      }
+      return { hosts };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `Failed to parse config ${this.path}: ${msg}\n  Back it up and remove it to reset.`,
+      );
     }
-    return { ...DEFAULTS };
   }
 
   save(): void {
-    const dir = join(this.path, "..");
+    const dir = dirname(this.path);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    writeFileSync(this.path, JSON.stringify(this.data, null, 2));
+    writeFileSync(this.path, JSON.stringify(this.data, null, 2), { mode: 0o600 });
   }
 
   getHost(name: string): HostConfig | undefined {
