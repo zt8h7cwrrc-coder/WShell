@@ -12,7 +12,8 @@
  */
 
 import WebSocket from "ws";
-import { createWriteStream, existsSync, statSync, createReadStream } from "fs";
+import { createWriteStream, existsSync, statSync, createReadStream, readFileSync } from "fs";
+import { randomUUID, createHash } from "crypto";
 import {
   createMessage,
   asMessage,
@@ -23,6 +24,7 @@ import {
   type FileChunkPayload,
   type ShellDataPayload,
   type ShellClosedPayload,
+  type BatchFileResult,
 } from "../shared/protocol.js";
 import { initCrypto, deriveKey, packEncrypted, packPlain, unpackFrame } from "../crypto/index.js";
 
@@ -76,12 +78,28 @@ export class TunnelClient {
   private currentDelay: number;
   private closed = false;
   private authedOnce = false;
+  /** Timestamp of the last inbound message, used for idle-timeout detection. */
+  private lastMsgAt = Date.now();
 
   private onShellData?: ShellDataHandler;
   private onShellClosed?: ShellClosedHandler;
   private onStatus?: StatusHandler;
   /** Per-remotePath chunk handlers for active downloads. */
   private downloadHandlers = new Map<string, FileChunkHandler>();
+  /** Per-batchId handler for inbound BatchData (batch download). */
+  private batchDownloadHandlers = new Map<
+    string,
+    (p: {
+      batchId: string;
+      fileIndex: number;
+      data: string;
+      chunkIndex: number;
+      isLastOfFile: boolean;
+      sha256?: string;
+    }) => void
+  >();
+  /** Per-batchId resolver for inbound BatchResult (batch upload). */
+  private batchUploadResults = new Map<string, (results: BatchFileResult[]) => void>();
 
   constructor(config: Partial<ClientConfig>) {
     this.cfg = { ...DEFAULTS, ...config };
@@ -128,6 +146,8 @@ export class TunnelClient {
       });
 
       ws.on("message", (raw) => {
+        // Any inbound frame proves the link is alive; refresh the idle watch.
+        this.lastMsgAt = Date.now();
         // First message is expected to be auth_result.
         const msg = this.tryParse(raw);
         if (!msg) return;
@@ -179,6 +199,8 @@ export class TunnelClient {
       this.reconnectTimer = null;
     }
     this.rejectAllPending(new Error("Client closed"));
+    this.batchDownloadHandlers.clear();
+    this.batchUploadResults.clear();
     this.ws?.close();
   }
 
@@ -234,6 +256,27 @@ export class TunnelClient {
         const handler = this.downloadHandlers.get(p.remotePath);
         if (handler) handler(msg, p);
         else this.tryResolvePending(msg);
+        break;
+      }
+      case Msg.BatchData: {
+        // Routed to the active batch download handler for this batchId.
+        const p = payload<{
+          batchId: string;
+          fileIndex: number;
+          data: string;
+          chunkIndex: number;
+          isLastOfFile: boolean;
+          sha256?: string;
+        }>(msg);
+        const bh = this.batchDownloadHandlers.get(p.batchId);
+        if (bh) bh(p);
+        break;
+      }
+      case Msg.BatchResult: {
+        // Server's per-file verification result for a batch upload.
+        const p = payload<{ batchId: string; results: BatchFileResult[] }>(msg);
+        const bh = this.batchUploadResults.get(p.batchId);
+        if (bh) bh(p.results);
         break;
       }
       case Msg.ExecResult:
@@ -324,6 +367,13 @@ export class TunnelClient {
 
   /**
    * Upload a file to the server.
+   *
+   * Chunks are streamed as they're read, but the *last* chunk is held back
+   * until the stream ends so it can be sent together with `done: true`.
+   * Effect: a file that fits in a single chunk is uploaded in exactly one
+   * message (data + done), instead of the old two-message "data then empty
+   * done" handshake. Larger files still stream incrementally; only the
+   * final flush carries the done flag.
    */
   uploadFile(localPath: string, remotePath: string, chunkSize = DOWNLOAD_CHUNK): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -334,32 +384,48 @@ export class TunnelClient {
       const stream = createReadStream(localPath, { highWaterMark: chunkSize });
       let idx = 0;
       let errored = false;
+      /** Pending chunk waiting for the next read to confirm it's not the last. */
+      let pending: Buffer | null = null;
 
-      stream.on("data", (chunk: Buffer | string) => {
-        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const flush = (final: boolean) => {
+        if (pending === null) return;
         this.sendRaw(
           createMessage(Msg.FileUpload, {
             remotePath,
-            data: buf.toString("base64"),
+            data: pending.toString("base64"),
             chunkIndex: idx,
             totalChunks: total,
-            done: false,
+            done: final,
           }),
         );
         idx++;
+        pending = null;
+      };
+
+      stream.on("data", (chunk: Buffer | string) => {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        // Flush the previously-held chunk as a non-final chunk.
+        flush(false);
+        pending = buf;
       });
 
       stream.on("end", () => {
         // 'error' may have already rejected the promise; don't settle twice.
         if (errored) return;
-        this.sendRaw(
-          createMessage(Msg.FileUpload, {
-            remotePath,
-            chunkIndex: idx,
-            totalChunks: idx,
-            done: true,
-          }),
-        );
+        // Send the last chunk (if any) with done: true. For an empty file
+        // pending is null → send a single empty done marker.
+        if (pending !== null) {
+          flush(true);
+        } else {
+          this.sendRaw(
+            createMessage(Msg.FileUpload, {
+              remotePath,
+              chunkIndex: idx,
+              totalChunks: idx,
+              done: true,
+            }),
+          );
+        }
         resolve();
       });
 
@@ -445,6 +511,193 @@ export class TunnelClient {
     });
   }
 
+  /* ── Batch transfer ────────────────────────────────────────────────── */
+
+  /**
+   * Upload many files in a single handshake.
+   *
+   * The manifest (path + size + sha256 for every file) is sent once; chunks
+   * for all files then stream back-to-back with no per-file ack. The server
+   * verifies each file's sha256 and replies with one `BatchResult` covering
+   * the whole batch. This is dramatically faster than N separate
+   * `uploadFile` calls for many small files, where per-file request/ack
+   * round-trips dominate latency.
+   *
+   * @returns per-file results; rejects only on transport failure.
+   */
+  uploadFiles(
+    files: { localPath: string; remotePath: string }[],
+    chunkSize = DOWNLOAD_CHUNK,
+  ): Promise<BatchFileResult[]> {
+    return new Promise((resolve, reject) => {
+      // Build the manifest: hash each local file up front.
+      const specs: { index: number; remotePath: string; size: number; sha256: string }[] = [];
+      const localMap = new Map<number, string>();
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        if (!existsSync(f.localPath)) {
+          return reject(new Error(`File not found: ${f.localPath}`));
+        }
+        const stat = statSync(f.localPath);
+        const sha256 = createHash("sha256").update(readFileSync(f.localPath)).digest("hex");
+        specs.push({ index: i, remotePath: f.remotePath, size: stat.size, sha256 });
+        localMap.set(i, f.localPath);
+      }
+
+      const batchId = randomUUID();
+      const timer = setTimeout(() => {
+        this.batchUploadResults.delete(batchId);
+        reject(new Error("Batch upload timeout"));
+      }, 120_000);
+
+      this.batchUploadResults.set(batchId, (results) => {
+        clearTimeout(timer);
+        this.batchUploadResults.delete(batchId);
+        resolve(results);
+      });
+
+      // 1. Send the manifest (the single handshake).
+      this.sendRaw(createMessage(Msg.BatchUpload, { batchId, files: specs }));
+
+      // 2. Stream every file's chunks back-to-back, no per-file ack.
+      //    Sequential streaming keeps memory bounded and respects the
+      //    server's backpressure drops (sendRaw drops at 8MB buffer).
+      let cursor = 0;
+      const streamNext = () => {
+        if (cursor >= files.length) return; // server will verify + reply
+        const idx = cursor++;
+        const rs = createReadStream(localMap.get(idx)!, { highWaterMark: chunkSize });
+        let chunkIdx = 0;
+        let pending: Buffer | null = null;
+        const flush = (isLast: boolean) => {
+          if (pending === null) return;
+          this.sendRaw(
+            createMessage(Msg.BatchData, {
+              batchId,
+              fileIndex: idx,
+              data: pending.toString("base64"),
+              chunkIndex: chunkIdx,
+              isLastOfFile: isLast,
+            }),
+          );
+          chunkIdx++;
+          pending = null;
+        };
+        rs.on("data", (chunk: Buffer | string) => {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          flush(false);
+          pending = buf;
+        });
+        rs.on("end", () => {
+          if (pending !== null) {
+            flush(true);
+          } else {
+            // Empty file: send a single empty last-chunk.
+            this.sendRaw(
+              createMessage(Msg.BatchData, {
+                batchId,
+                fileIndex: idx,
+                data: "",
+                chunkIndex: chunkIdx,
+                isLastOfFile: true,
+              }),
+            );
+          }
+          streamNext();
+        });
+        rs.on("error", (err) => {
+          clearTimeout(timer);
+          this.batchUploadResults.delete(batchId);
+          reject(err);
+        });
+      };
+      streamNext();
+    });
+  }
+
+  /**
+   * Download many files in a single handshake.
+   *
+   * The server streams every file's chunks back-to-back, each file's last
+   * chunk carrying its sha256. The client writes each file and verifies the
+   * hash locally; a mismatch marks that file as failed but does not abort
+   * the rest of the batch.
+   *
+   * @returns per-file results (success + sha256Ok).
+   */
+  downloadFiles(
+    files: { remotePath: string; localPath: string }[],
+    chunkSize = DOWNLOAD_CHUNK,
+  ): Promise<BatchFileResult[]> {
+    return new Promise((resolve, reject) => {
+      const batchId = randomUUID();
+      const timer = setTimeout(() => {
+        this.batchDownloadHandlers.delete(batchId);
+        reject(new Error("Batch download timeout"));
+      }, 120_000);
+
+      const results: BatchFileResult[] = [];
+      // Per-fileIndex: write stream + rolling hash + ordered chunk buffer.
+      const writers = new Map<
+        number,
+        { ws: ReturnType<typeof createWriteStream>; hash: ReturnType<typeof createHash>; pending: Map<number, string>; next: number; path: string }
+      >();
+      for (let i = 0; i < files.length; i++) {
+        writers.set(i, {
+          ws: createWriteStream(files[i].localPath),
+          hash: createHash("sha256"),
+          pending: new Map(),
+          next: 0,
+          path: files[i].localPath,
+        });
+        results.push({ fileIndex: i, remotePath: files[i].remotePath, success: false });
+      }
+
+      const finish = (err?: Error) => {
+        clearTimeout(timer);
+        this.batchDownloadHandlers.delete(batchId);
+        if (err) {
+          for (const w of writers.values()) w.ws.destroy();
+          reject(err);
+        } else {
+          resolve(results);
+        }
+      };
+
+      this.batchDownloadHandlers.set(batchId, (p) => {
+        const w = writers.get(p.fileIndex);
+        if (!w) return;
+        if (p.data) w.pending.set(p.chunkIndex, p.data);
+        // Flush in-order chunks to disk.
+        while (true) {
+          const d = w.pending.get(w.next);
+          if (d === undefined) break;
+          w.pending.delete(w.next);
+          const buf = Buffer.from(d, "base64");
+          w.ws.write(buf);
+          w.hash.update(buf);
+          w.next++;
+        }
+        if (p.isLastOfFile) {
+          w.ws.end();
+          const actual = w.hash.digest("hex");
+          const ok = p.sha256 !== undefined && p.sha256 !== "" && p.sha256 === actual;
+          results[p.fileIndex] = {
+            fileIndex: p.fileIndex,
+            remotePath: files[p.fileIndex].remotePath,
+            success: ok,
+            sha256Ok: ok,
+            error: ok ? undefined : "sha256 mismatch",
+          };
+          writers.delete(p.fileIndex);
+          if (writers.size === 0) finish();
+        }
+      });
+
+      this.sendRaw(createMessage(Msg.BatchDownload, { batchId, files: files.map((f) => f.remotePath), chunkSize }));
+    });
+  }
+
   /**
    * Register handlers for incoming shell data/closure.
    */
@@ -491,10 +744,24 @@ export class TunnelClient {
 
   /* ── Heartbeat ─────────────────────────────────────────────────────── */
 
+  /**
+   * The server initiates heartbeats (ping) and we answer (pong). We must
+   * NOT send our own ping — the server does not handle inbound ping and
+   * would reply "Unknown: ping". Instead, this timer watches for inbound
+   * silence: if no frame (including the server's ping) arrives within a
+   * few heartbeat windows, the link is presumed dead and we close to
+   * trigger reconnection.
+   */
   private startHeartbeat(): void {
     this.stopHeartbeat();
+    this.lastMsgAt = Date.now();
     this.pingTimer = setInterval(() => {
-      this.sendRaw(createMessage(Msg.Ping, {}));
+      const idle = Date.now() - this.lastMsgAt;
+      if (idle > this.cfg.heartbeatMs * 3) {
+        this.log("heartbeat idle timeout, closing to reconnect");
+        this.ws?.close();
+        // 'close' handler will schedule reconnect.
+      }
     }, this.cfg.heartbeatMs);
   }
 

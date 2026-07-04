@@ -116,23 +116,34 @@ node dist/cli/client.js myhost
 
 ## Usage
 
+WShell's CLI mirrors `ssh` / `scp`: `wshell <user@host>` drops you straight
+into the remote terminal; subcommands handle one-shot operations.
+
 ### Client Commands (wshell)
 
 ```bash
-# Interactive shell
+# Interactive shell — connects, opens a remote PTY, enters raw passthrough.
+# You're talking directly to the remote terminal: vim/top/sudo/Ctrl-C/Ctrl-D
+# all work just like ssh. Type "exit" on the remote side to leave.
 wshell <user@host>
 wshell <user@host:port>         # With port
 wshell <name>                   # Use saved config
 
-# Execute a single command
+# Run one command, print its output, exit (like `ssh host cmd`)
 wshell <user@host> exec "ls -la"
 wshell <user@host> exec "df -h"
 
-# Upload file
+# Upload a file (like `scp local host:remote`)
 wshell <user@host> put ./local.txt /remote/path.txt
 
-# Download file
+# Upload many files in one handshake (batch, with SHA-256 verify)
+wshell <user@host> put a.txt b.txt c.txt /remote/dir/
+
+# Download a file (like `scp host:remote local`)
 wshell <user@host> get /remote/path.txt ./local.txt
+
+# Download many files in one handshake (batch, with SHA-256 verify)
+wshell <user@host> get /remote/a.txt /remote/b.txt ./local-dir/
 
 # Generate new token
 wshell keygen
@@ -141,19 +152,12 @@ wshell keygen
 wshell help
 ```
 
-### Interactive Shell Commands
-
-After connecting, use these commands in the interactive mode:
-
-```
-wshell> /shell                    # Open interactive terminal
-wshell> /exec ls -la              # Execute command
-wshell> /put ./file.txt /tmp/f    # Upload file
-wshell> /get /tmp/f ./file.txt    # Download file
-wshell> /quit                     # Exit
-```
-
-Direct input is sent to the shell session.
+> The old in-session `/shell`, `/exec`, `/put`, `/get`, `/quit` REPL commands
+> have been removed. Their replacements are the `exec` / `put` / `get`
+> subcommands above (run from a separate terminal, just as you would with
+> `scp` alongside `ssh`); `/shell` is now the default behaviour of a bare
+> `wshell <host>`, and `/quit` is just `exit` on the remote side or closing
+> the terminal.
 
 ### Server Commands (wshelld)
 

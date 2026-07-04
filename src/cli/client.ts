@@ -20,8 +20,8 @@
 
 import { TunnelClient } from "../client/index.js";
 import { Config, type HostConfig } from "../shared/config.js";
-import * as readline from "readline";
 import { randomBytes } from "crypto";
+import { basename } from "path";
 import { fatal } from "./util.js";
 
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
@@ -37,11 +37,11 @@ function banner() {
 
 function showHelp() {
   console.log(`
-  Usage:
-    wshell <user@host>                    Interactive shell
-    wshell <user@host> exec <command>     Execute a command
-    wshell <user@host> put <lp> <rp>      Upload a file
-    wshell <user@host> get <rp> <lp>      Download a file
+  Usage (SSH-style):
+    wshell <user@host>                    Interactive shell (drops into remote terminal)
+    wshell <user@host> exec <command>     Run one command, print output, exit
+    wshell <user@host> put <local...> <remote>   Upload file(s) — multiple = batch into a dir
+    wshell <user@host> get <remote...> <local-dir>  Download file(s) — batch with hash verify
     wshell <user@host:port>               With port in host string
     wshell <user@host> -P <port>          With port flag
 
@@ -55,6 +55,14 @@ function showHelp() {
 
   Help:
     wshell help                           Show this message
+
+  Batch transfer: 'put a b c /dir/' uploads all three files in one handshake
+  with SHA-256 verification — far faster than per-file transfers for many
+  small files. Single-file 'put a /dir/a' uses the same fast path.
+
+  In an interactive shell, you're talking directly to the remote PTY —
+  Ctrl-C, Ctrl-D, vim, top, sudo all work just like ssh. Type "exit" on
+  the remote side (or close the terminal) to leave.
 `);
 }
 
@@ -201,7 +209,7 @@ async function connectOnce(target: HostConfig): Promise<TunnelClient> {
   return client;
 }
 
-/* ─── Interactive shell ───────────────────────────────────────────────── */
+/* ─── Interactive shell (SSH-style: drop straight into the remote terminal) */
 
 async function cmdShell(target: HostConfig) {
   if (!target.token) {
@@ -214,13 +222,16 @@ async function cmdShell(target: HostConfig) {
   });
 
   let currentSession: string | null = null;
-  let rl: readline.Interface | null = null;
+  let exited = false;
 
   // Restore terminal state on any exit path.
   const cleanup = () => {
     leaveRawMode();
     client.close();
   };
+  // SIGINT/SIGTERM only fire from outside raw mode (e.g. `kill`, or Ctrl-C
+  // before the shell opens). Once we're in raw mode, Ctrl-C is delivered to
+  // the remote PTY as 0x03 — exactly like ssh.
   process.on("SIGINT", () => {
     cleanup();
     process.exit(0);
@@ -233,31 +244,18 @@ async function cmdShell(target: HostConfig) {
   client.onShellOutput(
     (_id, data) => process.stdout.write(data),
     (_id, info) => {
+      // Remote shell exited → leave the client, like ssh does.
       currentSession = null;
       leaveRawMode();
+      if (exited) return;
+      exited = true;
       console.log(
         `\n[shell closed · exit ${info.exitCode}${info.signal ? ` (${info.signal})` : ""}]`,
       );
-      prompt();
+      cleanup();
+      process.exit(info.exitCode ?? 0);
     },
   );
-
-  function prompt() {
-    if (!rl || currentSession) return;
-    rl.question(`\x1b[36m${target.user}@${target.host}>\x1b[0m `, async (answer: string) => {
-      const cmd = answer.trim();
-      if (!cmd) {
-        prompt();
-        return;
-      }
-      try {
-        await handleShellCmd(client, cmd, target);
-      } catch (e) {
-        console.log(`Error: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      prompt();
-    });
-  }
 
   // Forward terminal resize events to the remote shell.
   process.stdout.on("resize", () => {
@@ -266,77 +264,25 @@ async function cmdShell(target: HostConfig) {
     }
   });
 
+  // Raw stdin passthrough: every byte goes to the remote PTY. No local
+  // echo, no line editing, no slash commands — the remote shell owns the
+  // terminal. This is what makes vim/top/sudo/Ctrl-C/Ctrl-D behave exactly
+  // as they would over ssh.
   process.stdin.on("data", (data) => {
     if (!currentSession) return;
-    const str = data.toString("utf-8");
-    if (str === "\x03" || str === "\x04") {
-      // Ctrl-C / Ctrl-D: leave the remote shell but keep the client.
-      client.closeShell(currentSession);
-      currentSession = null;
-      leaveRawMode();
-      console.log("\n[shell closed]");
-      prompt();
-      return;
-    }
-    client.sendShellData(currentSession, str);
+    client.sendShellData(currentSession, data.toString("utf-8"));
   });
 
   console.log(`  Connecting to ${target.user}@${target.host}:${target.port}...`);
   await client.connect();
-  console.log();
 
-  rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  console.log("  Commands: /shell, /exec, /put, /get, /quit");
-  console.log();
-  prompt();
-
-  async function handleShellCmd(client: TunnelClient, cmd: string, target: HostConfig) {
-    if (cmd === "/quit" || cmd === "/exit") {
-      cleanup();
-      process.exit(0);
-    }
-
-    if (cmd === "/shell") {
-      const cols = process.stdout.columns || 80;
-      const rows = process.stdout.rows || 24;
-      currentSession = await client.openShell(cols, rows);
-      enterRawMode();
-      console.log(`[shell ${currentSession}]`);
-      return;
-    }
-
-    if (cmd.startsWith("/exec ")) {
-      const result = await client.exec(cmd.slice(6));
-      if (result.stdout) process.stdout.write(result.stdout);
-      if (result.stderr) process.stderr.write(result.stderr);
-      if (result.exitCode !== 0) console.log(`\n[exit ${result.exitCode}]`);
-      return;
-    }
-
-    if (cmd.startsWith("/put ")) {
-      const [lp, rp] = cmd.slice(5).split(/\s+/);
-      if (!lp || !rp) {
-        console.log("Usage: /put <local> <remote>");
-        return;
-      }
-      await client.uploadFile(lp, rp);
-      console.log(`Uploaded ${lp} → ${target.host}:${rp}`);
-      return;
-    }
-
-    if (cmd.startsWith("/get ")) {
-      const [rp, lp] = cmd.slice(5).split(/\s+/);
-      if (!rp || !lp) {
-        console.log("Usage: /get <remote> <local>");
-        return;
-      }
-      await client.downloadFile(rp, lp);
-      console.log(`Downloaded ${target.host}:${rp} → ${lp}`);
-      return;
-    }
-
-    console.log(`Unknown: ${cmd}\n  Commands: /shell, /exec, /put, /get, /quit`);
-  }
+  // Auto-open a remote PTY and enter raw passthrough immediately.
+  const cols = process.stdout.columns || 80;
+  const rows = process.stdout.rows || 24;
+  currentSession = await client.openShell(cols, rows);
+  enterRawMode();
+  process.stdin.resume();
+  // No banner, no prompt, no "/shell" — we're in the remote terminal now.
 }
 
 /* ─── Direct exec ─────────────────────────────────────────────────────── */
@@ -358,34 +304,83 @@ async function cmdExec(target: HostConfig, command: string) {
   }
 }
 
-/* ─── Direct upload ───────────────────────────────────────────────────── */
+/* ─── Direct upload (single or batch) ─────────────────────────────────── */
+//
+// `wshell host put a b c /dir/`        → batch upload, remote names = a,b,c in /dir/
+// `wshell host put a /dir/a`           → single file (batch of 1, fast path)
+// Mirrors scp semantics: last arg is the remote destination. Multiple
+// sources go into a remote directory.
 
-async function cmdPut(target: HostConfig, local: string, remote: string) {
+async function cmdPut(target: HostConfig, paths: string[]) {
   if (!target.token) fatal("No token configured");
+  if (paths.length < 2) fatal("Usage: wshell <host> put <local...> <remote>");
+
+  const localFiles = paths.slice(0, -1);
+  const remoteDest = paths[paths.length - 1];
+  // If multiple sources, the destination is treated as a directory and each
+  // file keeps its basename (like scp). A single source keeps the exact
+  // remote path the user gave.
+  const files =
+    localFiles.length === 1
+      ? [{ localPath: localFiles[0], remotePath: remoteDest }]
+      : localFiles.map((lp) => ({
+          localPath: lp,
+          remotePath: remoteDest.replace(/\/$/, "") + "/" + basename(lp),
+        }));
 
   const client = await connectOnce(target);
-
   try {
-    await client.uploadFile(local, remote);
-    console.log(`Uploaded ${local} → ${target.host}:${remote}`);
+    const results = await client.uploadFiles(files);
+    let ok = 0;
+    let fail = 0;
+    for (const r of results) {
+      if (r.success) {
+        ok++;
+        console.log(`  ✓ ${files[r.fileIndex].localPath} → ${target.host}:${r.remotePath}`);
+      } else {
+        fail++;
+        console.error(`  ✗ ${files[r.fileIndex].localPath} → ${r.remotePath}: ${r.error ?? "failed"}`);
+      }
+    }
     client.close();
+    console.log(`\n  Uploaded ${ok} file(s)${fail ? `, ${fail} failed` : ""}.`);
+    if (fail) process.exit(1);
   } catch (e) {
     client.close();
     fatal(e instanceof Error ? e.message : String(e));
   }
 }
 
-/* ─── Direct download ─────────────────────────────────────────────────── */
+/* ─── Direct download (single or batch) ───────────────────────────────── */
 
-async function cmdGet(target: HostConfig, remote: string, local: string) {
+async function cmdGet(target: HostConfig, paths: string[]) {
   if (!target.token) fatal("No token configured");
+  if (paths.length < 2) fatal("Usage: wshell <host> get <remote...> <local-dir>");
+
+  const remoteFiles = paths.slice(0, -1);
+  const localDir = paths[paths.length - 1];
+  const files = remoteFiles.map((rp) => ({
+    remotePath: rp,
+    localPath: localDir.replace(/\/$/, "") + "/" + basename(rp),
+  }));
 
   const client = await connectOnce(target);
-
   try {
-    await client.downloadFile(remote, local);
-    console.log(`Downloaded ${target.host}:${remote} → ${local}`);
+    const results = await client.downloadFiles(files);
+    let ok = 0;
+    let fail = 0;
+    for (const r of results) {
+      if (r.success) {
+        ok++;
+        console.log(`  ✓ ${target.host}:${r.remotePath} → ${files[r.fileIndex].localPath}`);
+      } else {
+        fail++;
+        console.error(`  ✗ ${r.remotePath}: ${r.error ?? "failed"}`);
+      }
+    }
     client.close();
+    console.log(`\n  Downloaded ${ok} file(s)${fail ? `, ${fail} failed` : ""}.`);
+    if (fail) process.exit(1);
   } catch (e) {
     client.close();
     fatal(`Download failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -463,14 +458,14 @@ async function main() {
   }
 
   if (sub === "put") {
-    if (!rest[1] || !rest[2]) fatal("Usage: wshell <host> put <local> <remote>");
-    await cmdPut(target, rest[1], rest[2]);
+    if (rest.length < 3) fatal("Usage: wshell <host> put <local...> <remote>");
+    await cmdPut(target, rest.slice(1));
     return;
   }
 
   if (sub === "get") {
-    if (!rest[1] || !rest[2]) fatal("Usage: wshell <host> get <remote> <local>");
-    await cmdGet(target, rest[1], rest[2]);
+    if (rest.length < 3) fatal("Usage: wshell <host> get <remote...> <local-dir>");
+    await cmdGet(target, rest.slice(1));
     return;
   }
 

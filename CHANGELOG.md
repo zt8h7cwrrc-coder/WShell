@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-07-04
+
+### Added
+
+- **Batch file transfer** — Upload or download many small files in a single handshake instead of one round-trip per file. A manifest (path + size + SHA-256) is sent once; chunks for all files stream back-to-back with no per-file ack; the receiver verifies each file's SHA-256 and reports per-file results in one final message. Dramatically faster for many small files where per-file handshakes previously dominated latency.
+  - New protocol messages: `batch_upload`, `batch_download`, `batch_data`, `batch_result`.
+  - Client: `uploadFiles(files[])` / `downloadFiles(files[])`.
+  - CLI: `wshell host put a b c /dir/` and `wshell host get /r/a /r/b ./dir/` (multiple sources = batch into a directory, single source = exact path).
+  - Integrity guaranteed by SHA-256 verification even without per-file acks.
+
+### Changed
+
+- **CLI is now SSH-style** — `wshell user@host` drops straight into the remote terminal (auto `openShell` + raw passthrough), instead of showing a `wshell>` prompt that required typing `/shell` first. Removes the learning cost of the old in-session REPL. `vim`/`top`/`sudo`/`Ctrl-C`/`Ctrl-D` now behave exactly like `ssh`.
+- **Removed slash commands** — `/shell`, `/exec`, `/put`, `/get`, `/quit` are gone. Their replacements: bare `wshell host` (was `/shell`), `wshell host exec "cmd"` (was `/exec`), `wshell host put`/`get` (was `/put`/`/get`), and remote `exit`/closing the terminal (was `/quit`).
+- **Upload message merging** — The last chunk of a file now carries the `done` flag, so a single-chunk file uploads in one message instead of two (data + empty done). Larger files save one message each.
+
+### Fixed
+
+- **Character duplication in interactive shell** — Typing `sudo` appeared as `ssuuddoo`; Chinese IME composition appeared as `sudosudo`. Root cause: `readline.createInterface` (terminal mode) was left open while piping raw bytes to the remote PTY, so both readline and the remote shell echoed each keystroke. Fixed by closing readline before entering raw passthrough (and the SSH-style rewrite removes readline from the shell path entirely).
+- **`[wshell] server error: Unknown: ping`** — The client's heartbeat sent `ping` to the server, but the protocol is server-initiated (`ping`) → client (`pong`); the server had no `ping` handler and reported it as unknown. Fixed by replacing the client's outbound ping with an idle-timeout watchdog (closes the link if no frame arrives within 3 heartbeat windows), and adding a tolerant `case Msg.Ping` on the server.
+
 ## [1.0.0] - 2026-07-03
 
 ### Added
@@ -58,5 +79,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Config management (`~/.wshell/config.json`).
 - Third-party license tracking.
 
+[1.1.0]: https://github.com/zt8h7cwrrc-coder/WShell/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/zt8h7cwrrc-coder/WShell/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/zt8h7cwrrc-coder/WShell/releases/tag/v0.1.0

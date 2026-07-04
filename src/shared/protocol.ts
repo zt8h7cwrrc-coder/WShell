@@ -49,6 +49,12 @@ export const Msg = {
   Ping: "ping",
   Pong: "pong",
   Error: "error",
+  // Batch transfer: one handshake for many small files, with SHA-256
+  // verification so correctness doesn't depend on per-file acks.
+  BatchUpload: "batch_upload",
+  BatchDownload: "batch_download",
+  BatchData: "batch_data",
+  BatchResult: "batch_result",
 } as const;
 
 export type MsgType = (typeof Msg)[keyof typeof Msg];
@@ -129,6 +135,57 @@ export interface UploadDonePayload {
   success: boolean;
   error?: string;
 }
+
+/* ─── Batch transfer payloads ─────────────────────────────────────────── */
+//
+// One handshake (the Start message) carries the manifest for every file in
+// the batch; chunks for all files then stream back-to-back in BatchData
+// messages without any per-file round-trip. SHA-256 hashes declared up
+// front let the receiver verify integrity once at the end, so dropping the
+// per-file ack does not sacrifice correctness.
+
+export interface BatchFileSpec {
+  /** Index within the batch; matches `fileIndex` on BatchData chunks. */
+  index: number;
+  /** Server-side path for upload, remote path for download. */
+  remotePath: string;
+  /** Expected byte length (informational; used for early rejection). */
+  size?: number;
+  /** Expected SHA-256 hex of the file content. Required for verification. */
+  sha256: string;
+}
+
+export interface BatchUploadPayload {
+  batchId: string;
+  files: BatchFileSpec[];
+}
+export interface BatchDownloadPayload {
+  batchId: string;
+  files: string[]; // remote paths
+  chunkSize?: number;
+}
+export interface BatchDataPayload {
+  batchId: string;
+  fileIndex: number;
+  data: string; // base64
+  chunkIndex: number;
+  isLastOfFile: boolean;
+  /** Present on the last chunk so the receiver can verify without a map. */
+  sha256?: string;
+}
+export interface BatchFileResult {
+  fileIndex: number;
+  remotePath: string;
+  success: boolean;
+  error?: string;
+  /** True when the declared hash matched the received bytes. */
+  sha256Ok?: boolean;
+}
+export interface BatchResultPayload {
+  batchId: string;
+  results: BatchFileResult[];
+}
+
 export interface EmptyPayload {}
 export interface ErrorPayload {
   message: string;
@@ -151,6 +208,10 @@ export type MessageMap = {
   [Msg.FileDownload]: FileDownloadPayload;
   [Msg.FileChunk]: FileChunkPayload;
   [Msg.UploadDone]: UploadDonePayload;
+  [Msg.BatchUpload]: BatchUploadPayload;
+  [Msg.BatchDownload]: BatchDownloadPayload;
+  [Msg.BatchData]: BatchDataPayload;
+  [Msg.BatchResult]: BatchResultPayload;
   [Msg.Ping]: EmptyPayload;
   [Msg.Pong]: EmptyPayload;
   [Msg.Error]: ErrorPayload;

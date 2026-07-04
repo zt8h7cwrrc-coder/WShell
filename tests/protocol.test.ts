@@ -12,6 +12,10 @@ describe("Msg constants", () => {
     assert.equal(Msg.Exec, "exec");
     assert.equal(Msg.Ping, "ping");
     assert.equal(Msg.Error, "error");
+    assert.equal(Msg.BatchUpload, "batch_upload");
+    assert.equal(Msg.BatchDownload, "batch_download");
+    assert.equal(Msg.BatchData, "batch_data");
+    assert.equal(Msg.BatchResult, "batch_result");
   });
 });
 
@@ -22,6 +26,31 @@ describe("createMessage", () => {
     assert.ok(typeof msg.id === "string" && msg.id.length > 0);
     assert.ok(typeof msg.ts === "number");
     assert.deepEqual(msg.payload, {});
+  });
+
+  it("creates a batch_upload message with file specs", () => {
+    const msg = createMessage(Msg.BatchUpload, {
+      batchId: "b1",
+      files: [{ index: 0, remotePath: "/tmp/a", sha256: "abc" }],
+    });
+    assert.equal(msg.type, "batch_upload");
+    const p = payload<{ batchId: string; files: { index: number; remotePath: string; sha256: string }[] }>(msg);
+    assert.equal(p.batchId, "b1");
+    assert.equal(p.files.length, 1);
+    assert.equal(p.files[0].remotePath, "/tmp/a");
+  });
+
+  it("creates a batch_data message", () => {
+    const msg = createMessage(Msg.BatchData, {
+      batchId: "b1",
+      fileIndex: 2,
+      data: "aGVsbG8=",
+      chunkIndex: 0,
+      isLastOfFile: false,
+    });
+    const p = payload<{ batchId: string; fileIndex: number; isLastOfFile: boolean }>(msg);
+    assert.equal(p.fileIndex, 2);
+    assert.equal(p.isLastOfFile, false);
   });
 
   it("sets replyTo when provided", () => {

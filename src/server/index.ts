@@ -12,11 +12,18 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "http";
 import { exec as execCb } from "child_process";
 import type { WriteStream } from "fs";
-import { createWriteStream, existsSync, statSync, createReadStream } from "fs";
+import { createWriteStream, existsSync, statSync, createReadStream, readFileSync } from "fs";
 import { resolve as resolvePath, isAbsolute, relative as relativePath } from "path";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import { Authenticator, DEFAULT_AUTH_FILE } from "../shared/auth.js";
-import { createMessage, asMessage, Msg, type Message } from "../shared/protocol.js";
+import {
+  createMessage,
+  asMessage,
+  Msg,
+  type Message,
+  type BatchFileSpec,
+  type BatchFileResult,
+} from "../shared/protocol.js";
 import { initCrypto, deriveKey, packEncrypted, packPlain, unpackFrame } from "../crypto/index.js";
 import { spawnPty, ptyAvailable, type PtyHandle } from "./pty.js";
 
@@ -67,6 +74,21 @@ interface ClientConn {
   shells: Map<string, ShellSession>;
   uploadStreams: Map<string, { stream: WriteStream; bytes: number }>;
   authFailures: number[];
+  /** Active batch upload sessions, keyed by batchId. */
+  batchUploads: Map<
+    string,
+    {
+      specs: BatchFileSpec[];
+      /** Per fileIndex: write stream + rolling hash + byte count. */
+      writers: Map<number, { stream: WriteStream; hash: ReturnType<typeof createHash>; bytes: number }>;
+      results: BatchFileResult[];
+    }
+  >;
+}
+
+/** Compute SHA-256 hex of a file on disk. */
+function hashFileSync(absPath: string): string {
+  return createHash("sha256").update(readFileSync(absPath)).digest("hex");
 }
 
 /* ─── Defaults ───────────────────────────────────────────────────────── */
@@ -166,6 +188,7 @@ export class TunnelServer {
       shells: new Map(),
       uploadStreams: new Map(),
       authFailures: [],
+      batchUploads: new Map(),
     };
     this.clients.set(id, client);
     this.log(`connection from ${ip} (${id}) · PTY ${ptyAvailable() ? "on" : "off"}`);
@@ -248,8 +271,18 @@ export class TunnelServer {
         return this.handleFileUpload(client, msg);
       case Msg.FileDownload:
         return this.handleFileDownload(client, msg);
+      case Msg.BatchUpload:
+        return this.handleBatchUploadStart(client, msg);
+      case Msg.BatchDownload:
+        return this.handleBatchDownload(client, msg);
+      case Msg.BatchData:
+        return this.handleBatchData(client, msg);
       case Msg.Pong:
         return; // heartbeat ack
+      case Msg.Ping:
+        // Protocol is server-initiated ping → client pong. Tolerate an
+        // inbound ping (e.g. from an older client) instead of erroring.
+        return;
       default:
         this.sendError(client, `Unknown: ${msg.type as string}`, msg.id);
     }
@@ -571,6 +604,246 @@ export class TunnelServer {
     return base;
   }
 
+  /* ── Batch transfer ────────────────────────────────────────────────── */
+  //
+  // One handshake per batch, not per file. The client declares the whole
+  // manifest up front (path + size + sha256 for each file); we open all
+  // write streams, then chunks for every file stream in as BatchData
+  // messages with no per-file ack. When the client signals the last chunk
+  // of a file (isLastOfFile), we close that stream and verify the rolling
+  // hash against the declared sha256. A single BatchResult at the end
+  // reports per-file success — one round trip for the whole batch.
+
+  private handleBatchUploadStart(client: ClientConn, msg: Message): void {
+    const { batchId, files } = msg.payload as {
+      batchId: string;
+      files: BatchFileSpec[];
+    };
+
+    if (!batchId || !Array.isArray(files) || files.length === 0) {
+      this.sendError(client, "Invalid batch manifest", msg.id);
+      return;
+    }
+
+    // Pre-validate every path and reject the whole batch if any is unsafe.
+    // This keeps "one handshake = atomic batch" semantics: either all
+    // files are accepted and streamed, or none.
+    const resolved: { spec: BatchFileSpec; abs: string }[] = [];
+    for (const spec of files) {
+      const safe = this.resolveSafePath(spec.remotePath);
+      if (!safe) {
+        this.send(
+          client,
+          createMessage(Msg.BatchResult, {
+            batchId,
+            results: files.map((f) => ({
+              fileIndex: f.index,
+              remotePath: f.remotePath,
+              success: false,
+              error: "Path not allowed",
+            })),
+          }),
+        );
+        return;
+      }
+      resolved.push({ spec, abs: safe });
+    }
+
+    const writers = new Map<number, { stream: WriteStream; hash: ReturnType<typeof createHash>; bytes: number }>();
+    for (const { spec, abs } of resolved) {
+      try {
+        const stream = createWriteStream(abs);
+        writers.set(spec.index, { stream, hash: createHash("sha256"), bytes: 0 });
+      } catch (e) {
+        // Couldn't open one file — abort the batch, report all as failed.
+        for (const w of writers.values()) w.stream.destroy();
+        this.send(
+          client,
+          createMessage(Msg.BatchResult, {
+            batchId,
+            results: files.map((f) => ({
+              fileIndex: f.index,
+              remotePath: f.remotePath,
+              success: false,
+              error: "Failed to open for write",
+            })),
+          }),
+        );
+        return;
+      }
+    }
+
+    client.batchUploads.set(batchId, { specs: files, writers, results: [] });
+  }
+
+  private handleBatchData(client: ClientConn, msg: Message): void {
+    const { batchId, fileIndex, data, chunkIndex, isLastOfFile, sha256 } = msg.payload as {
+      batchId: string;
+      fileIndex: number;
+      data: string;
+      chunkIndex: number;
+      isLastOfFile: boolean;
+      sha256?: string;
+    };
+
+    const batch = client.batchUploads.get(batchId);
+    if (!batch) return; // stale/unknown batch — drop silently
+    const entry = batch.writers.get(fileIndex);
+    if (!entry) return;
+
+    if (data) {
+      const buf = Buffer.from(data, "base64");
+      entry.bytes += buf.length;
+      if (entry.bytes > UPLOAD_MAX_BYTES) {
+        entry.stream.destroy();
+        batch.writers.delete(fileIndex);
+        batch.results.push({
+          fileIndex,
+          remotePath: batch.specs.find((s) => s.index === fileIndex)?.remotePath ?? "",
+          success: false,
+          error: "File too large",
+        });
+        return;
+      }
+      entry.stream.write(buf);
+      entry.hash.update(buf);
+    }
+
+    if (isLastOfFile) {
+      entry.stream.end();
+      batch.writers.delete(fileIndex);
+      const spec = batch.specs.find((s) => s.index === fileIndex);
+      const actual = entry.hash.digest("hex");
+      const expected = sha256 ?? spec?.sha256;
+      const ok = expected === actual;
+      batch.results.push({
+        fileIndex,
+        remotePath: spec?.remotePath ?? "",
+        success: ok,
+        sha256Ok: ok,
+        error: ok ? undefined : "sha256 mismatch",
+      });
+
+      // When the last file is verified, send the single result message and
+      // tear down the batch session.
+      if (batch.results.length === batch.specs.length) {
+        this.send(client, createMessage(Msg.BatchResult, { batchId, results: batch.results }));
+        client.batchUploads.delete(batchId);
+      }
+    }
+  }
+
+  private handleBatchDownload(client: ClientConn, msg: Message): void {
+    const { batchId, files, chunkSize = DOWNLOAD_CHUNK } = msg.payload as {
+      batchId: string;
+      files: string[];
+      chunkSize?: number;
+    };
+
+    if (!batchId || !Array.isArray(files) || files.length === 0) {
+      this.sendError(client, "Invalid batch download request", msg.id);
+      return;
+    }
+
+    // Pre-resolve + hash every file, then stream them all back-to-back.
+    // Hashing happens before sending so each file's sha256 travels on its
+    // last chunk, letting the client verify without a separate handshake.
+    const manifest: { index: number; remotePath: string; abs: string; sha256: string }[] = [];
+    for (let i = 0; i < files.length; i++) {
+      const safe = this.resolveSafePath(files[i]);
+      if (!safe || !existsSync(safe)) {
+        // Send an empty error-marker chunk for this file so the client's
+        // per-file handler can record the failure.
+        this.send(
+          client,
+          createMessage(Msg.BatchData, {
+            batchId,
+            fileIndex: i,
+            data: "",
+            chunkIndex: 0,
+            isLastOfFile: true,
+            sha256: "",
+          }),
+        );
+        continue;
+      }
+      manifest.push({ index: i, remotePath: files[i], abs: safe, sha256: hashFileSync(safe) });
+    }
+
+    // Stream each file's chunks sequentially. Backpressure: pause the read
+    // stream if the WS buffer saturates, resume on 'drain'.
+    let fileCursor = 0;
+    /** The currently-active read stream, for pause/resume from the drain handler. */
+    let active: { rs: ReturnType<typeof createReadStream>; paused: boolean } | null = null;
+
+    const drainHandler = () => {
+      if (active && active.paused && client.ws.bufferedAmount < 1 * 1024 * 1024) {
+        active.paused = false;
+        active.rs.resume();
+      }
+    };
+    client.ws.on("drain", drainHandler);
+
+    const streamFile = () => {
+      if (fileCursor >= manifest.length) {
+        client.ws.removeListener("drain", drainHandler);
+        return; // batch complete — client verifies locally from sha256 fields
+      }
+      const f = manifest[fileCursor++];
+      const rs = createReadStream(f.abs, { highWaterMark: chunkSize });
+      active = { rs, paused: false };
+      let idx = 0;
+      rs.on("data", (chunk: Buffer | string) => {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        idx++;
+        this.send(
+          client,
+          createMessage(Msg.BatchData, {
+            batchId,
+            fileIndex: f.index,
+            data: buf.toString("base64"),
+            chunkIndex: idx - 1,
+            isLastOfFile: false,
+          }),
+        );
+        if (client.ws.bufferedAmount > 4 * 1024 * 1024) {
+          active!.paused = true;
+          rs.pause();
+        }
+      });
+      rs.on("end", () => {
+        // Last chunk for this file carries the hash.
+        this.send(
+          client,
+          createMessage(Msg.BatchData, {
+            batchId,
+            fileIndex: f.index,
+            data: "",
+            chunkIndex: idx,
+            isLastOfFile: true,
+            sha256: f.sha256,
+          }),
+        );
+        streamFile(); // next file
+      });
+      rs.on("error", () => {
+        this.send(
+          client,
+          createMessage(Msg.BatchData, {
+            batchId,
+            fileIndex: f.index,
+            data: "",
+            chunkIndex: 0,
+            isLastOfFile: true,
+            sha256: "",
+          }),
+        );
+        streamFile();
+      });
+    };
+    streamFile();
+  }
+
   /* ── Housekeeping ──────────────────────────────────────────────────── */
 
   private cleanupClient(client: ClientConn): void {
@@ -590,6 +863,16 @@ export class TunnelServer {
       }
     }
     client.uploadStreams.clear();
+    for (const [, b] of client.batchUploads) {
+      for (const w of b.writers.values()) {
+        try {
+          w.stream.destroy();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    client.batchUploads.clear();
   }
 
   private cleanupStaleSessions(): void {

@@ -1,6 +1,6 @@
 {
   "name": "wshell",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Encrypted direct-connect remote shell — stable alternative to SSH",
   "type": "module",
   "main": "dist/server/index.js",
